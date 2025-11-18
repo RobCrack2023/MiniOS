@@ -30,8 +30,8 @@ String WIFI_SSID = "";
 String WIFI_PASS = "";
 
 // Backend
-String BACKEND_HOST = "";  // IP o dominio del VPS
-int BACKEND_PORT = 3000;
+String BACKEND_HOST = "minios.iot-robotics.cl";  // Dominio del backend
+int BACKEND_PORT = 80;  // Puerto 80 con Nginx, 443 con SSL
 
 // Hardware
 #define MAX_GPIOS 20
