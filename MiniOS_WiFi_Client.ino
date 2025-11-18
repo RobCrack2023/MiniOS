@@ -26,8 +26,8 @@
 #define FIRMWARE_VERSION "1.0.0"
 
 // WiFi - Configurar aquí o vía Serial
-String WIFI_SSID = "";
-String WIFI_PASS = "";
+String WIFI_SSID = "CASA ROJAS";
+String WIFI_PASS = "STD2024....";
 
 // Backend
 String BACKEND_HOST = "minios.iot-robotics.cl";  // Dominio del backend
@@ -101,6 +101,26 @@ int otaId = 0;
 String otaFilename = "";
 int otaFilesize = 0;
 String otaChecksum = "";
+
+// ============================================
+// PROTOTIPOS DE FUNCIONES
+// ============================================
+
+void connectWiFi();
+void connectWebSocket();
+void webSocketEvent(WStype_t type, uint8_t* payload, size_t length);
+void registerDevice();
+void handleWebSocketMessage(const char* payload);
+void handleConfig(JsonDocument& doc);
+void handleCommand(JsonDocument& doc);
+void sendSensorData();
+void readDHTSensors();
+void processGpioLoops();
+void startOTA(int id, String filename, int filesize, String checksum);
+void reportOTAStatus(const char* status, String error);
+void loadConfig();
+void saveConfig();
+void handleSerial();
 
 // ============================================
 // SETUP
