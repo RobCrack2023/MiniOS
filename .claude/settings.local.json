@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir /s \"C:\\proyectos_arduinos\\MiniOS_WiFi\")",
+      "Bash(dir /b \"C:\\proyectos_arduinos\\MiniOS_WiFi\")",
+      "Bash(git init:*)",
+      "Bash(git remote add:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
