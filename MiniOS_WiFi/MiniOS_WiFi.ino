@@ -19,8 +19,34 @@
 #define MAX_TASKS 8
 #define SERIAL_BAUD 115200
 #define AP_SSID "MiniOS-ESP32"
-#define AP_PASS "12345678"
+#define AP_PASS "12345678"      // Cambiar antes de desplegar: es publica en el repo
 #define WEB_PORT 80
+
+// Reintento de conexion WiFi cuando se pierde la red (ms)
+#define WIFI_RETRY_INTERVAL 30000
+
+// LED de la placa.
+// En el core 3.x, LED_BUILTIN de las variantes C3/S3 no es un GPIO: vale
+// SOC_GPIO_PIN_COUNT + 8 y digitalWrite() lo desvia al driver RMT del LED
+// direccionable, sin tocar nunca el nivel del pin. En placas con un LED normal
+// (C3 SuperMini) eso deja el pin como lo dejo pinMode(), o sea a nivel bajo,
+// y con un LED activo a nivel bajo se queda encendido para siempre.
+#if CONFIG_IDF_TARGET_ESP32C3
+  #define LED_PIN        8   // C3 SuperMini: LED azul
+  #define LED_ACTIVE_LOW 1   // se enciende con nivel bajo
+#elif defined(LED_BUILTIN)
+  #define LED_PIN        LED_BUILTIN
+  #define LED_ACTIVE_LOW 0
+#else
+  #define LED_PIN        2   // ESP32 clasico: LED en GPIO 2 en la mayoria de devkits
+  #define LED_ACTIVE_LOW 0
+#endif
+
+// Autenticacion de la interfaz web.
+// Con la contrasena vacia no se pide nada (comportamiento de siempre).
+// Al ponerle valor, todas las rutas piden usuario/contrasena por HTTP Basic.
+#define WEB_USER "admin"
+#define WEB_PASSWORD ""
 
 // ============================================
 // SISTEMA DE TAREAS SIMPLE
@@ -47,6 +73,7 @@ String wifiSSID = "";
 String wifiPassword = "";
 bool wifiConnected = false;
 bool apMode = false;
+bool webServerStarted = false;   // los handlers solo se registran una vez
 IPAddress localIP;
 
 // ============================================
@@ -55,6 +82,41 @@ IPAddress localIP;
 #define MAX_GPIOS 10
 
 // GPIOs clasificados por función según ESP32-S3
+// Las tablas dependen del chip. Con una tabla de S3 en un C3 el sketch compila
+// igual (son enteros), pero GPIO_ApplyConfig() acaba haciendo pinMode() sobre la
+// flash SPI interna y el chip se cuelga antes de que el USB llegue a enumerar.
+
+#if CONFIG_IDF_TARGET_ESP32C3
+
+// --- ESP32-C3 (probado en C3 SuperMini) ---
+// Solo existen GPIO 0..21. Reservados por hardware:
+//   11..17 -> flash SPI interna (tocarlos cuelga el chip)
+//   18, 19 -> USB D- / D+ (los usas y pierdes el puerto serie)
+//   20, 21 -> UART0
+// En la SuperMini, además, 11..19 ni siquiera salen al conector.
+
+// ADC1: canales 0..4. (GPIO 5 es ADC2 y no se puede usar con WiFi activo)
+const int ANALOG_GPIOS[] = {0, 1, 2, 3, 4};
+const int ANALOG_GPIOS_COUNT = 5;
+
+// Uso general. GPIO 9 es el botón BOOT y GPIO 8 lleva el LED: van en I2C_GPIOS
+// para que no se puedan reasignar por la interfaz web.
+const int DIGITAL_GPIOS[] = {5, 6, 7, 10};
+const int DIGITAL_GPIOS_COUNT = 4;
+
+const int I2C_GPIOS[] = {8, 9};  // 8=SDA (y LED), 9=SCL (y BOOT)
+const int I2C_GPIOS_COUNT = 2;
+
+// El C3 no tiene un bus SPI externo dedicado en esta placa
+const int SPI_GPIOS[] = {-1};
+const int SPI_GPIOS_COUNT = 0;
+
+#else  // ESP32-S3 y equivalentes
+
+#if !CONFIG_IDF_TARGET_ESP32S3
+#warning "Mapa de pines no verificado para este chip: se usa el del ESP32-S3. Revisa las tablas antes de grabar."
+#endif
+
 // GPIOs Analógicas (ADC)
 const int ANALOG_GPIOS[] = {1, 2, 4, 5, 6, 7};
 const int ANALOG_GPIOS_COUNT = 6;
@@ -70,6 +132,8 @@ const int I2C_GPIOS_COUNT = 2;
 // GPIOs SPI (usar con precaución)
 const int SPI_GPIOS[] = {10, 11, 12, 13};
 const int SPI_GPIOS_COUNT = 4;
+
+#endif
 
 // Modos de GPIO
 enum GPIOMode {
@@ -125,14 +189,25 @@ DHTConfig dhtSensors[MAX_DHT_SENSORS];
 int dhtCount = 0;
 
 // ============================================
-// SISTEMA DE PANTALLA TFT I2C
+// SISTEMA DE PANTALLA TFT (SPI por software)
 // ============================================
 // Pines para ST7735 SPI (128x160)
+#if CONFIG_IDF_TARGET_ESP32C3
+// En el C3 los pines 11 y 12 son la flash interna: inicializar la pantalla ahi
+// mata el chip. Estos son los que quedan libres; ajustar al cableado real.
+// Ojo: en una C3 SuperMini la pantalla se lleva casi todas las E/S disponibles.
+#define TFT_CS    7   // Chip select
+#define TFT_RST   10  // Reset
+#define TFT_DC    6   // Data/Command
+#define TFT_MOSI  5   // SPI MOSI
+#define TFT_SCLK  4   // SPI Clock
+#else
 #define TFT_CS    10  // Chip select
 #define TFT_RST   9   // Reset
 #define TFT_DC    8   // Data/Command
 #define TFT_MOSI  11  // SPI MOSI
 #define TFT_SCLK  12  // SPI Clock
+#endif
 
 // Colores comunes
 #define TFT_BLACK   0x0000
@@ -171,6 +246,84 @@ struct TFT_LastValues {
 TFT_LastValues tftLast;
 
 // ============================================
+// UTILIDADES
+// ============================================
+
+// Enciende o apaga el LED de la placa respetando su polaridad
+void ledWrite(bool on) {
+#if LED_ACTIVE_LOW
+    digitalWrite(LED_PIN, on ? LOW : HIGH);
+#else
+    digitalWrite(LED_PIN, on ? HIGH : LOW);
+#endif
+}
+
+
+// Escapa texto para meterlo dentro de una cadena JSON.
+// Sin esto, un nombre con comillas rompia el JSON entero y la interfaz web
+// se quedaba en "Cargando..." para siempre.
+String jsonEscape(const String &text) {
+    String out;
+    out.reserve(text.length() + 8);
+
+    for(size_t i = 0; i < text.length(); i++) {
+        char c = text.charAt(i);
+        switch(c) {
+            case '\"': out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if((uint8_t)c < 0x20) {
+                    char buf[7];
+                    snprintf(buf, sizeof(buf), "\\u%04x", (uint8_t)c);
+                    out += buf;
+                } else {
+                    out += c;
+                }
+        }
+    }
+
+    return out;
+}
+
+// Escapa texto para insertarlo en HTML o en un atributo delimitado por comillas
+// dobles. No toca la comilla simple: se usa junto a jsEscape().
+String htmlEscape(const String &text) {
+    String out;
+    out.reserve(text.length() + 8);
+
+    for(size_t i = 0; i < text.length(); i++) {
+        char c = text.charAt(i);
+        switch(c) {
+            case '&': out += "&amp;"; break;
+            case '<': out += "&lt;"; break;
+            case '>': out += "&gt;"; break;
+            case '\"': out += "&quot;"; break;
+            default: out += c;
+        }
+    }
+
+    return out;
+}
+
+// Escapa texto para una cadena JavaScript delimitada por comillas simples.
+// Se aplica ANTES de htmlEscape cuando el JS va dentro de un atributo.
+String jsEscape(const String &text) {
+    String out;
+    out.reserve(text.length() + 8);
+
+    for(size_t i = 0; i < text.length(); i++) {
+        char c = text.charAt(i);
+        if(c == '\\' || c == '\'') out += '\\';
+        out += c;
+    }
+
+    return out;
+}
+
+// ============================================
 // NÚCLEO DEL OS
 // ============================================
 
@@ -188,8 +341,8 @@ void OS_Init() {
     Serial.println("║   MiniOS ESP32-S3 + WiFi   ║");
     Serial.println("║      Sistema iniciado      ║");
     Serial.println("╚════════════════════════════╝");
-    Serial.printf("RAM libre: %d bytes\n", ESP.getFreeHeap());
-    Serial.printf("CPU: %d MHz\n", ESP.getCpuFreqMHz());
+    Serial.printf("RAM libre: %lu bytes\n", (unsigned long)ESP.getFreeHeap());
+    Serial.printf("CPU: %lu MHz\n", (unsigned long)ESP.getCpuFreqMHz());
 
     // Inicializar GPIO
     GPIO_Init();
@@ -287,9 +440,9 @@ bool GPIO_IsValid(int pin) {
 // Verificar si un GPIO es apropiado para un modo específico
 bool GPIO_IsAppropriate(int pin, GPIOMode mode) {
     // GPIOs analógicas solo para INPUT
+    // Los pines SPI e I2C no entran en ningun caso del switch: quedan excluidos
     bool isAnalog = GPIO_InList(pin, ANALOG_GPIOS, ANALOG_GPIOS_COUNT);
     bool isDigital = GPIO_InList(pin, DIGITAL_GPIOS, DIGITAL_GPIOS_COUNT);
-    bool isSPI = GPIO_InList(pin, SPI_GPIOS, SPI_GPIOS_COUNT);
 
     switch(mode) {
         case GPIO_OUTPUT:
@@ -307,27 +460,24 @@ bool GPIO_IsAppropriate(int pin, GPIOMode mode) {
     }
 }
 
-// Mantener compatibilidad - verificar si GPIO es válido
-bool GPIO_IsSafe(int pin) {
-    return GPIO_IsValid(pin);
-}
-
 // Obtener lista de GPIOs actualmente en uso
-void GPIO_GetInUse(int* inUseList, int* count) {
+// maxCount evita desbordar el buffer del llamador si algún día crecen los MAX_*
+void GPIO_GetInUse(int* inUseList, int* count, int maxCount) {
     *count = 0;
 
     // Pines de pantalla TFT (si está inicializada)
     if(tftInitialized) {
-        inUseList[(*count)++] = TFT_CS;    // 10
-        inUseList[(*count)++] = TFT_DC;    // 8
-        inUseList[(*count)++] = TFT_RST;   // 9
-        inUseList[(*count)++] = TFT_MOSI;  // 11
-        inUseList[(*count)++] = TFT_SCLK;  // 12
+        const int tftPins[] = {TFT_CS, TFT_DC, TFT_RST, TFT_MOSI, TFT_SCLK};
+        for(unsigned int i = 0; i < sizeof(tftPins) / sizeof(tftPins[0]); i++) {
+            if(*count >= maxCount) return;
+            inUseList[(*count)++] = tftPins[i];
+        }
     }
 
     // Pines configurados como GPIO
     for(int i = 0; i < MAX_GPIOS; i++) {
         if(gpioConfigs[i].active) {
+            if(*count >= maxCount) return;
             inUseList[(*count)++] = gpioConfigs[i].pin;
         }
     }
@@ -335,6 +485,7 @@ void GPIO_GetInUse(int* inUseList, int* count) {
     // Pines usados por sensores DHT
     for(int i = 0; i < MAX_DHT_SENSORS; i++) {
         if(dhtSensors[i].active) {
+            if(*count >= maxCount) return;
             inUseList[(*count)++] = dhtSensors[i].pin;
         }
     }
@@ -344,7 +495,7 @@ void GPIO_GetInUse(int* inUseList, int* count) {
 bool GPIO_IsInUse(int pin) {
     int inUseList[50];
     int count = 0;
-    GPIO_GetInUse(inUseList, &count);
+    GPIO_GetInUse(inUseList, &count, 50);
 
     for(int i = 0; i < count; i++) {
         if(inUseList[i] == pin) return true;
@@ -381,33 +532,41 @@ void GPIO_Init() {
 }
 
 // Guardar configuración en NVS
+// Los pines activos se guardan en ranuras consecutivas (g0_, g1_, ...) aunque
+// esten dispersos en el array: antes se guardaba con el indice del array pero
+// se leia hasta "count", asi que al borrar un pin se perdian los demas.
 void GPIO_SaveConfig() {
     preferences.begin("gpio", false);
-    preferences.putInt("count", gpioCount);
+
+    int saved = 0;
 
     for(int i = 0; i < MAX_GPIOS; i++) {
-        if(gpioConfigs[i].active) {
-            String prefix = "g" + String(i) + "_";
-            preferences.putInt((prefix + "pin").c_str(), gpioConfigs[i].pin);
-            preferences.putInt((prefix + "mode").c_str(), (int)gpioConfigs[i].mode);
-            preferences.putInt((prefix + "val").c_str(), gpioConfigs[i].value);
-            preferences.putString((prefix + "name").c_str(), gpioConfigs[i].name);
-            preferences.putBool((prefix + "loop").c_str(), gpioConfigs[i].loopEnabled);
-            preferences.putUInt((prefix + "intv").c_str(), gpioConfigs[i].loopInterval);
+        if(!gpioConfigs[i].active) continue;
 
-            // Guardar parámetros de fórmula
-            preferences.putBool((prefix + "hasf").c_str(), gpioConfigs[i].hasFormula);
-            if(gpioConfigs[i].hasFormula) {
-                preferences.putFloat((prefix + "mult").c_str(), gpioConfigs[i].multiplier);
-                preferences.putFloat((prefix + "offs").c_str(), gpioConfigs[i].offset);
-                preferences.putString((prefix + "unit").c_str(), gpioConfigs[i].unit);
-                preferences.putString((prefix + "ftyp").c_str(), gpioConfigs[i].formulaType);
-            }
+        String prefix = "g" + String(saved) + "_";
+        preferences.putInt((prefix + "pin").c_str(), gpioConfigs[i].pin);
+        preferences.putInt((prefix + "mode").c_str(), (int)gpioConfigs[i].mode);
+        preferences.putInt((prefix + "val").c_str(), gpioConfigs[i].value);
+        preferences.putString((prefix + "name").c_str(), gpioConfigs[i].name);
+        preferences.putBool((prefix + "loop").c_str(), gpioConfigs[i].loopEnabled);
+        preferences.putUInt((prefix + "intv").c_str(), gpioConfigs[i].loopInterval);
+
+        // Guardar parámetros de fórmula
+        preferences.putBool((prefix + "hasf").c_str(), gpioConfigs[i].hasFormula);
+        if(gpioConfigs[i].hasFormula) {
+            preferences.putFloat((prefix + "mult").c_str(), gpioConfigs[i].multiplier);
+            preferences.putFloat((prefix + "offs").c_str(), gpioConfigs[i].offset);
+            preferences.putString((prefix + "unit").c_str(), gpioConfigs[i].unit);
+            preferences.putString((prefix + "ftyp").c_str(), gpioConfigs[i].formulaType);
         }
+
+        saved++;
     }
 
+    preferences.putInt("count", saved);
     preferences.end();
-    Serial.println("[GPIO] Configuración guardada");
+
+    Serial.printf("[GPIO] Configuración guardada (%d pines)\n", saved);
 }
 
 // Cargar configuración desde NVS
@@ -419,9 +578,13 @@ void GPIO_LoadConfig() {
         String prefix = "g" + String(i) + "_";
         int pin = preferences.getInt((prefix + "pin").c_str(), -1);
 
-        if(pin >= 0 && GPIO_IsSafe(pin)) {
+        GPIOMode savedMode = (GPIOMode)preferences.getInt((prefix + "mode").c_str(), 0);
+
+        // Se descarta lo que ya no encaje con el pin: configuraciones viejas
+        // guardadas antes de que existieran estas comprobaciones
+        if(pin >= 0 && GPIO_IsValid(pin) && GPIO_IsAppropriate(pin, savedMode)) {
             gpioConfigs[i].pin = pin;
-            gpioConfigs[i].mode = (GPIOMode)preferences.getInt((prefix + "mode").c_str(), 0);
+            gpioConfigs[i].mode = savedMode;
             gpioConfigs[i].value = preferences.getInt((prefix + "val").c_str(), 0);
             gpioConfigs[i].name = preferences.getString((prefix + "name").c_str(), "GPIO" + String(pin));
             gpioConfigs[i].loopEnabled = preferences.getBool((prefix + "loop").c_str(), false);
@@ -522,7 +685,25 @@ int GPIO_Configure(int pin, GPIOMode mode, String name = "") {
     // Buscar si ya existe para actualizar
     for(int i = 0; i < MAX_GPIOS; i++) {
         if(gpioConfigs[i].active && gpioConfigs[i].pin == pin) {
-            // Actualizar configuración existente
+            // Al salir de PWM hay que soltar el canal LEDC: si no, el pin sigue
+            // atado al periférico y digitalWrite() no se comporta como se espera
+            if(gpioConfigs[i].mode == GPIO_PWM && mode != GPIO_PWM) {
+                ledcDetach(pin);
+            }
+
+            // La fórmula de conversión solo tiene sentido en entradas
+            if(mode != GPIO_INPUT && mode != GPIO_INPUT_PULLUP) {
+                gpioConfigs[i].hasFormula = false;
+                gpioConfigs[i].multiplier = 1.0;
+                gpioConfigs[i].offset = 0.0;
+                gpioConfigs[i].unit = "";
+                gpioConfigs[i].formulaType = "";
+                gpioConfigs[i].convertedValue = 0.0;
+            }
+
+            // El valor anterior puede no tener sentido en el modo nuevo
+            gpioConfigs[i].value = 0;
+
             gpioConfigs[i].mode = mode;
             if(name.length() > 0) gpioConfigs[i].name = name;
             GPIO_ApplyConfig(i);
@@ -666,7 +847,7 @@ String GPIO_GetStatusJSON() {
 
             json += "{";
             json += "\"pin\":" + String(gpioConfigs[i].pin) + ",";
-            json += "\"name\":\"" + gpioConfigs[i].name + "\",";
+            json += "\"name\":\"" + jsonEscape(gpioConfigs[i].name) + "\",";
             json += "\"mode\":" + String((int)gpioConfigs[i].mode) + ",";
             json += "\"value\":" + String(gpioConfigs[i].value) + ",";
             json += "\"loop\":" + String(gpioConfigs[i].loopEnabled ? "true" : "false") + ",";
@@ -676,8 +857,8 @@ String GPIO_GetStatusJSON() {
             json += "\"hasFormula\":" + String(gpioConfigs[i].hasFormula ? "true" : "false");
             if(gpioConfigs[i].hasFormula) {
                 json += ",\"convertedValue\":" + String(gpioConfigs[i].convertedValue, 3);
-                json += ",\"unit\":\"" + gpioConfigs[i].unit + "\"";
-                json += ",\"formulaType\":\"" + gpioConfigs[i].formulaType + "\"";
+                json += ",\"unit\":\"" + jsonEscape(gpioConfigs[i].unit) + "\"";
+                json += ",\"formulaType\":\"" + jsonEscape(gpioConfigs[i].formulaType) + "\"";
             }
 
             json += "}";
@@ -752,20 +933,25 @@ void DHT_Init() {
 }
 
 // Guardar configuración en NVS
+// Mismo compactado de ranuras que en GPIO_SaveConfig
 void DHT_SaveConfig() {
     preferences.begin("dht", false);
-    preferences.putInt("count", dhtCount);
+
+    int saved = 0;
 
     for(int i = 0; i < MAX_DHT_SENSORS; i++) {
-        if(dhtSensors[i].active) {
-            String prefix = "d" + String(i) + "_";
-            preferences.putInt((prefix + "pin").c_str(), dhtSensors[i].pin);
-            preferences.putString((prefix + "name").c_str(), dhtSensors[i].name);
-        }
+        if(!dhtSensors[i].active) continue;
+
+        String prefix = "d" + String(saved) + "_";
+        preferences.putInt((prefix + "pin").c_str(), dhtSensors[i].pin);
+        preferences.putString((prefix + "name").c_str(), dhtSensors[i].name);
+        saved++;
     }
 
+    preferences.putInt("count", saved);
     preferences.end();
-    Serial.println("[DHT] Configuración guardada");
+
+    Serial.printf("[DHT] Configuración guardada (%d sensores)\n", saved);
 }
 
 // Cargar configuración desde NVS
@@ -777,7 +963,7 @@ void DHT_LoadConfig() {
         String prefix = "d" + String(i) + "_";
         int pin = preferences.getInt((prefix + "pin").c_str(), -1);
 
-        if(pin >= 0 && GPIO_IsSafe(pin)) {
+        if(pin >= 0 && GPIO_InList(pin, DIGITAL_GPIOS, DIGITAL_GPIOS_COUNT)) {
             dhtSensors[i].pin = pin;
             dhtSensors[i].name = preferences.getString((prefix + "name").c_str(), "DHT11-" + String(pin));
             dhtSensors[i].sensor = new DHT(pin, DHT11);
@@ -794,16 +980,17 @@ void DHT_LoadConfig() {
 
 // Configurar un nuevo sensor DHT
 int DHT_Configure(int pin, String name = "") {
-    if(!GPIO_IsSafe(pin)) {
-        Serial.printf("[DHT] ⚠️ GPIO %d no es seguro\n", pin);
+    // Un DHT necesita un pin digital bidireccional. GPIO_IsSafe solo comprobaba
+    // que el pin existiera, asi que por API se podia poner un DHT en un pin
+    // I2C o SPI y chocar con la pantalla.
+    if(!GPIO_InList(pin, DIGITAL_GPIOS, DIGITAL_GPIOS_COUNT)) {
+        Serial.printf("[DHT] ⚠️ GPIO %d no es un pin digital válido para DHT\n", pin);
         return -1;
     }
 
     // Verificar si el pin ya está en uso como DHT
-    bool alreadyDHT = false;
     for(int i = 0; i < MAX_DHT_SENSORS; i++) {
         if(dhtSensors[i].active && dhtSensors[i].pin == pin) {
-            alreadyDHT = true;
             Serial.printf("[DHT] Pin %d ya está configurado como DHT\n", pin);
             return -1;
         }
@@ -909,7 +1096,7 @@ String DHT_GetStatusJSON() {
 
             json += "{";
             json += "\"pin\":" + String(dhtSensors[i].pin) + ",";
-            json += "\"name\":\"" + dhtSensors[i].name + "\",";
+            json += "\"name\":\"" + jsonEscape(dhtSensors[i].name) + "\",";
             json += "\"temperature\":" + String(dhtSensors[i].temperature, 1) + ",";
             json += "\"humidity\":" + String(dhtSensors[i].humidity, 1) + ",";
             json += "\"lastRead\":" + String(dhtSensors[i].lastRead) + ",";
@@ -938,6 +1125,16 @@ void taskDHTRead() {
 // Inicializar pantalla TFT
 bool TFT_Init() {
     if(tftInitialized) return true;
+
+    // La comprobación de conflictos era unidireccional: GPIO y DHT miraban si la
+    // pantalla usaba el pin, pero la pantalla arrancaba encima de lo que hubiera.
+    const int tftPins[] = {TFT_CS, TFT_DC, TFT_RST, TFT_MOSI, TFT_SCLK};
+    for(unsigned int i = 0; i < sizeof(tftPins) / sizeof(tftPins[0]); i++) {
+        if(GPIO_IsInUse(tftPins[i])) {
+            Serial.printf("[TFT] ⚠️ GPIO %d ya está en uso, no se inicializa la pantalla\n", tftPins[i]);
+            return false;
+        }
+    }
 
     Serial.println("[TFT] Inicializando pantalla...");
 
@@ -1247,14 +1444,33 @@ void taskTFTUpdate() {
 // SISTEMA WIFI
 // ============================================
 
-void WiFi_Init() {
-    // Cargar configuración guardada
+// Guardar credenciales WiFi.
+// Cada acceso abre y cierra su namespace: antes WiFi_Init dejaba "minios" abierto
+// para siempre, el primer GPIO_SaveConfig fallaba al abrir "gpio" (Preferences
+// devuelve false si ya hay uno abierto), escribia las claves de GPIO dentro de
+// "minios" y al cerrar dejaba el objeto inutilizable, con lo que guardar el WiFi
+// desde la web no hacia nada aunque dijera "Configuración guardada".
+void WiFi_SaveCredentials(const String &ssid, const String &pass) {
     preferences.begin("minios", false);
+    preferences.putString("ssid", ssid);
+    preferences.putString("password", pass);
+    preferences.end();
+}
+
+void WiFi_LoadCredentials() {
+    preferences.begin("minios", true);
     wifiSSID = preferences.getString("ssid", "");
     wifiPassword = preferences.getString("password", "");
+    preferences.end();
+}
+
+void WiFi_Init() {
+    // Cargar configuración guardada
+    WiFi_LoadCredentials();
     
     if(wifiSSID.length() > 0) {
         Serial.printf("[WiFi] Conectando a: %s\n", wifiSSID.c_str());
+        WiFi.mode(WIFI_STA);
         WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str());
         
         // Intentar conectar por 10 segundos
@@ -1282,7 +1498,10 @@ void WiFi_Init() {
 
 void WiFi_StartAP() {
     Serial.println("[WiFi] Iniciando Punto de Acceso...");
-    WiFi.mode(WIFI_AP);
+
+    // AP_STA en vez de AP: con AP a secas la parte estacion queda apagada y el
+    // equipo no volvia a intentar conectarse a la red nunca mas
+    WiFi.mode(wifiSSID.length() > 0 ? WIFI_AP_STA : WIFI_AP);
     WiFi.softAP(AP_SSID, AP_PASS);
     
     localIP = WiFi.softAPIP();
@@ -1298,9 +1517,32 @@ void WiFi_StartAP() {
     WiFi_StartWebServer();
 }
 
+// Comprueba la autenticación de la interfaz web.
+// Con WEB_PASSWORD vacía no pide nada, igual que antes.
+bool webAuthOK() {
+    if(strlen(WEB_PASSWORD) == 0) return true;
+
+    if(!server.authenticate(WEB_USER, WEB_PASSWORD)) {
+        server.requestAuthentication();
+        return false;
+    }
+
+    return true;
+}
+
 void WiFi_StartWebServer() {
+    // Si ya está arrancado no se vuelve a registrar nada: WiFi_StartAP() llama
+    // aquí en cada caída de la red y cada llamada añadía otra copia de los ~20
+    // handlers a la lista interna de WebServer (fuga de memoria y despacho
+    // duplicado).
+    if(webServerStarted) {
+        Serial.println("[Web] Servidor ya iniciado");
+        return;
+    }
+
     // Página principal
     server.on("/", []() {
+        if(!webAuthOK()) return;
         String html = "<!DOCTYPE html><html><head>";
         html += "<meta charset='UTF-8'>";
         html += "<title>MiniOS ESP32-S3</title>";
@@ -1418,7 +1660,9 @@ void WiFi_StartWebServer() {
         html += "<div id='WiFi' class='tabcontent'>";
         html += "<form action='/config' method='POST'>";
         html += "<h3>⚙️ Configurar WiFi</h3>";
-        html += "<input type='text' name='ssid' placeholder='SSID' value='" + wifiSSID + "'>";
+        // Si se llega desde el escaneo con ?ssid=..., se rellena esa red
+        String presetSSID = server.hasArg("ssid") ? server.arg("ssid") : wifiSSID;
+        html += "<input type=\"text\" id=\"ssidInput\" name=\"ssid\" placeholder=\"SSID\" value=\"" + htmlEscape(presetSSID) + "\">";
         html += "<input type='password' name='pass' placeholder='Contraseña'>";
         html += "<button type='submit'>💾 Guardar y Conectar</button>";
         html += "</form>";
@@ -1554,6 +1798,15 @@ void WiFi_StartWebServer() {
 
         html += "loadGPIOs();loadSafePins(1);loadDHTs();loadAvailablePins();loadTFTStatus();";
         html += "setInterval(loadGPIOs,3000);setInterval(loadDHTs,5000);setInterval(loadTFTStatus,3000);";
+
+        // Al llegar desde el escaneo de redes se abre directamente la pestaña WiFi.
+        // Antes el clic redirigía a /?ssid=... y la página ignoraba el parámetro:
+        // seleccionar una red no hacía absolutamente nada.
+        if(server.hasArg("ssid")) {
+            html += "document.querySelectorAll('.tablinks').forEach(function(b){";
+            html += "if(b.textContent.trim()=='WiFi')b.click();});";
+        }
+
         html += "</script>";
 
         html += "</div></body></html>";
@@ -1562,6 +1815,7 @@ void WiFi_StartWebServer() {
     
     // Configurar WiFi
     server.on("/config", HTTP_POST, []() {
+        if(!webAuthOK()) return;
         String newSSID = server.arg("ssid");
         String newPass = server.arg("pass");
         
@@ -1569,14 +1823,13 @@ void WiFi_StartWebServer() {
             wifiSSID = newSSID;
             wifiPassword = newPass;
             
-            // Guardar en memoria flash
-            preferences.putString("ssid", wifiSSID);
-            preferences.putString("password", wifiPassword);
+            // Guardar en memoria flash (abre y cierra su propio namespace)
+            WiFi_SaveCredentials(wifiSSID, wifiPassword);
             
             String html = "<html><head><meta charset='UTF-8'></head>";
             html += "<body style='background:#1a1a1a;color:#fff;font-family:Arial;text-align:center;padding:50px;'>";
             html += "<h2>✅ Configuración guardada</h2>";
-            html += "<p>Conectando a: " + wifiSSID + "</p>";
+            html += "<p>Conectando a: " + htmlEscape(wifiSSID) + "</p>";
             html += "<p>El sistema se reiniciará...</p>";
             html += "<script>setTimeout(function(){window.location='/'}, 3000);</script>";
             html += "</body></html>";
@@ -1584,11 +1837,18 @@ void WiFi_StartWebServer() {
             
             delay(1000);
             ESP.restart();
+        } else {
+            // Antes no se respondia nada y el navegador se quedaba colgado
+            server.send(400, "text/html",
+                "<html><head><meta charset='UTF-8'></head><body style='background:#1a1a1a;color:#fff;"
+                "font-family:Arial;text-align:center;padding:50px;'><h2>El SSID no puede estar vacio</h2>"
+                "<p><a style='color:#4CAF50' href='/'>Volver</a></p></body></html>");
         }
     });
     
     // Escanear redes
     server.on("/scan", HTTP_POST, []() {
+        if(!webAuthOK()) return;
         String html = "<html><head>";
         html += "<meta charset='UTF-8'>";
         html += "<style>body{background:#1a1a1a;color:#fff;font-family:Arial;margin:20px;}";
@@ -1605,8 +1865,10 @@ void WiFi_StartWebServer() {
             html += "<p>No se encontraron redes</p>";
         } else {
             for(int i = 0; i < n; i++) {
-                html += "<div class='network' onclick=\"selectNetwork('" + WiFi.SSID(i) + "')\">";
-                html += "📶 " + WiFi.SSID(i);
+                // jsEscape primero (cadena JS) y htmlEscape despues (atributo HTML):
+                // un SSID con comilla simple rompia la pagina entera
+                html += "<div class='network' onclick=\"selectNetwork('" + htmlEscape(jsEscape(WiFi.SSID(i))) + "')\">";
+                html += "📶 " + htmlEscape(WiFi.SSID(i));
                 html += " (" + String(WiFi.RSSI(i)) + " dBm)";
                 html += WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? " 🔓" : " 🔐";
                 html += "</div>";
@@ -1625,15 +1887,17 @@ void WiFi_StartWebServer() {
     
     // Control del LED
     server.on("/led", HTTP_POST, []() {
+        if(!webAuthOK()) return;
         static bool ledState = false;
         ledState = !ledState;
-        digitalWrite(LED_BUILTIN, ledState);
+        ledWrite(ledState);
         server.sendHeader("Location", "/");
         server.send(303);
     });
     
     // Reiniciar sistema
     server.on("/reboot", HTTP_POST, []() {
+        if(!webAuthOK()) return;
         String html = "<html><head><meta charset='UTF-8'></head>";
         html += "<body style='background:#1a1a1a;color:#fff;text-align:center;padding:50px;'>";
         html += "<h2>🔄 Reiniciando...</h2>";
@@ -1645,6 +1909,7 @@ void WiFi_StartWebServer() {
     
     // API JSON para estado
     server.on("/api/status", []() {
+        if(!webAuthOK()) return;
         String json = "{";
         json += "\"uptime\":" + String(millis()/1000) + ",";
         json += "\"freeHeap\":" + String(ESP.getFreeHeap()) + ",";
@@ -1662,12 +1927,14 @@ void WiFi_StartWebServer() {
 
     // Obtener estado de todos los GPIOs
     server.on("/api/gpio", HTTP_GET, []() {
+        if(!webAuthOK()) return;
         String json = GPIO_GetStatusJSON();
         server.send(200, "application/json", json);
     });
 
     // Configurar un GPIO
     server.on("/api/gpio/config", HTTP_POST, []() {
+        if(!webAuthOK()) return;
         if(!server.hasArg("pin") || !server.hasArg("mode")) {
             server.send(400, "application/json", "{\"error\":\"Missing parameters\"}");
             return;
@@ -1693,6 +1960,7 @@ void WiFi_StartWebServer() {
 
     // Escribir valor digital
     server.on("/api/gpio/set", HTTP_POST, []() {
+        if(!webAuthOK()) return;
         if(!server.hasArg("pin") || !server.hasArg("value")) {
             server.send(400, "application/json", "{\"error\":\"Missing parameters\"}");
             return;
@@ -1710,6 +1978,7 @@ void WiFi_StartWebServer() {
 
     // Escribir valor PWM
     server.on("/api/gpio/pwm", HTTP_POST, []() {
+        if(!webAuthOK()) return;
         if(!server.hasArg("pin") || !server.hasArg("value")) {
             server.send(400, "application/json", "{\"error\":\"Missing parameters\"}");
             return;
@@ -1727,6 +1996,7 @@ void WiFi_StartWebServer() {
 
     // Leer valor digital
     server.on("/api/gpio/read", HTTP_GET, []() {
+        if(!webAuthOK()) return;
         if(!server.hasArg("pin")) {
             server.send(400, "application/json", "{\"error\":\"Missing pin parameter\"}");
             return;
@@ -1744,6 +2014,7 @@ void WiFi_StartWebServer() {
 
     // Eliminar GPIO
     server.on("/api/gpio/remove", HTTP_POST, []() {
+        if(!webAuthOK()) return;
         if(!server.hasArg("pin")) {
             server.send(400, "application/json", "{\"error\":\"Missing pin parameter\"}");
             return;
@@ -1760,13 +2031,14 @@ void WiFi_StartWebServer() {
 
     // Obtener lista de GPIOs disponibles según modo (excluye los ocupados)
     server.on("/api/gpio/safe", HTTP_GET, []() {
+        if(!webAuthOK()) return;
         String modeStr = server.hasArg("mode") ? server.arg("mode") : "";
         int mode = modeStr.toInt();
 
         // Obtener pines en uso
         int inUseList[50];
         int inUseCount = 0;
-        GPIO_GetInUse(inUseList, &inUseCount);
+        GPIO_GetInUse(inUseList, &inUseCount, 50);
 
         String json = "[";
         bool first = true;
@@ -1828,6 +2100,7 @@ void WiFi_StartWebServer() {
 
     // Activar/desactivar modo loop
     server.on("/api/gpio/loop", HTTP_POST, []() {
+        if(!webAuthOK()) return;
         if(!server.hasArg("pin")) {
             server.send(400, "application/json", "{\"error\":\"Missing pin parameter\"}");
             return;
@@ -1849,6 +2122,7 @@ void WiFi_StartWebServer() {
 
     // Configurar fórmula de conversión para pin analógico
     server.on("/api/gpio/formula", HTTP_POST, []() {
+        if(!webAuthOK()) return;
         if(!server.hasArg("pin")) {
             server.send(400, "application/json", "{\"error\":\"Missing pin parameter\"}");
             return;
@@ -1903,12 +2177,14 @@ void WiFi_StartWebServer() {
 
     // Obtener estado de todos los sensores DHT
     server.on("/api/dht", HTTP_GET, []() {
+        if(!webAuthOK()) return;
         String json = DHT_GetStatusJSON();
         server.send(200, "application/json", json);
     });
 
     // Configurar un nuevo sensor DHT
     server.on("/api/dht/config", HTTP_POST, []() {
+        if(!webAuthOK()) return;
         if(!server.hasArg("pin")) {
             server.send(400, "application/json", "{\"error\":\"Missing pin parameter\"}");
             return;
@@ -1928,6 +2204,7 @@ void WiFi_StartWebServer() {
 
     // Eliminar sensor DHT
     server.on("/api/dht/remove", HTTP_POST, []() {
+        if(!webAuthOK()) return;
         if(!server.hasArg("pin")) {
             server.send(400, "application/json", "{\"error\":\"Missing pin parameter\"}");
             return;
@@ -1944,6 +2221,7 @@ void WiFi_StartWebServer() {
 
     // Leer un sensor DHT específico
     server.on("/api/dht/read", HTTP_GET, []() {
+        if(!webAuthOK()) return;
         if(!server.hasArg("pin")) {
             server.send(400, "application/json", "{\"error\":\"Missing pin parameter\"}");
             return;
@@ -1973,6 +2251,7 @@ void WiFi_StartWebServer() {
 
     // Inicializar pantalla
     server.on("/api/tft/init", HTTP_POST, []() {
+        if(!webAuthOK()) return;
         if(TFT_Init()) {
             server.send(200, "application/json", "{\"success\":true,\"message\":\"Pantalla inicializada\"}");
         } else {
@@ -1982,12 +2261,14 @@ void WiFi_StartWebServer() {
 
     // Apagar pantalla
     server.on("/api/tft/off", HTTP_POST, []() {
+        if(!webAuthOK()) return;
         TFT_Off();
         server.send(200, "application/json", "{\"success\":true,\"message\":\"Pantalla apagada\"}");
     });
 
     // Configurar modo de visualización
     server.on("/api/tft/mode", HTTP_POST, []() {
+        if(!webAuthOK()) return;
         if(!server.hasArg("mode")) {
             server.send(400, "application/json", "{\"error\":\"Missing mode parameter\"}");
             return;
@@ -2027,6 +2308,7 @@ void WiFi_StartWebServer() {
 
     // Obtener estado de pantalla
     server.on("/api/tft/status", HTTP_GET, []() {
+        if(!webAuthOK()) return;
         String json = "{";
         json += "\"initialized\":" + String(tftInitialized ? "true" : "false") + ",";
         json += "\"enabled\":" + String(tftEnabled ? "true" : "false") + ",";
@@ -2036,7 +2318,9 @@ void WiFi_StartWebServer() {
     });
 
     server.begin();
-    Serial.println("[Web] Servidor iniciado en puerto 80");
+    webServerStarted = true;
+    Serial.printf("[Web] Servidor iniciado en puerto %d%s\n", WEB_PORT,
+                  strlen(WEB_PASSWORD) > 0 ? " (con autenticación)" : "");
 }
 
 // ============================================
@@ -2100,22 +2384,23 @@ void OS_ExecuteCommand(String cmd) {
         Serial.printf("Total: %d/%d tareas\n\n", taskCount, MAX_TASKS);
     }
     else if(cmd == "free") {
-        Serial.printf("\n💾 RAM Total: %d bytes\n", ESP.getHeapSize());
-        Serial.printf("💾 RAM Libre: %d bytes\n", ESP.getFreeHeap());
-        Serial.printf("💾 RAM Usada: %d bytes\n\n", ESP.getHeapSize() - ESP.getFreeHeap());
+        Serial.printf("\n💾 RAM Total: %lu bytes\n", (unsigned long)ESP.getHeapSize());
+        Serial.printf("💾 RAM Libre: %lu bytes\n", (unsigned long)ESP.getFreeHeap());
+        Serial.printf("💾 RAM Usada: %lu bytes\n\n", (unsigned long)(ESP.getHeapSize() - ESP.getFreeHeap()));
     }
     else if(cmd == "temp") {
         Serial.printf("\n🌡️ Temperatura CPU: %.1f°C\n\n", temperatureRead());
     }
     else if(cmd == "ip") {
         Serial.printf("\n📍 IP: %s\n", localIP.toString().c_str());
-        if(apMode) {
-            Serial.println("📡 Modo: Punto de Acceso");
-            Serial.printf("📶 SSID: %s\n", AP_SSID);
-        } else if(wifiConnected) {
+        if(wifiConnected) {
             Serial.println("📡 Modo: Cliente WiFi");
             Serial.printf("📶 SSID: %s\n", WiFi.SSID().c_str());
-            Serial.printf("📊 Señal: %d dBm\n", WiFi.RSSI());
+            Serial.printf("📊 Señal: %d dBm\n", (int)WiFi.RSSI());
+            if(apMode) Serial.printf("📡 AP también activo: %s\n", AP_SSID);
+        } else if(apMode) {
+            Serial.println("📡 Modo: Punto de Acceso");
+            Serial.printf("📶 SSID: %s\n", AP_SSID);
         }
         Serial.printf("🌐 Web: http://%s\n\n", localIP.toString().c_str());
     }
@@ -2132,7 +2417,7 @@ void OS_ExecuteCommand(String cmd) {
                 Serial.printf("%2d | %-20s | %3d dBm | %s\n",
                     i+1,
                     WiFi.SSID(i).c_str(),
-                    WiFi.RSSI(i),
+                    (int)WiFi.RSSI(i),
                     WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "Abierta" : "Segura");
             }
             Serial.println();
@@ -2142,19 +2427,38 @@ void OS_ExecuteCommand(String cmd) {
         Serial.println("\nConfiguración WiFi:");
         Serial.print("SSID: ");
         
-        // Esperar entrada del SSID
-        while(!Serial.available()) { delay(10); }
+        // Con espera acotada: antes se quedaba bloqueado indefinidamente y
+        // congelaba el servidor web y todas las tareas
+        unsigned long waitStart = millis();
+        while(!Serial.available()) {
+            if(millis() - waitStart > 30000) {
+                Serial.println("\n⏱️ Tiempo agotado, cancelado");
+                return;
+            }
+            delay(10);
+        }
         String ssid = Serial.readStringUntil('\n');
         ssid.trim();
+
+        if(ssid.length() == 0) {
+            Serial.println("\n❌ SSID vacío, cancelado");
+            return;
+        }
         
         Serial.print("Password: ");
-        while(!Serial.available()) { delay(10); }
+        waitStart = millis();
+        while(!Serial.available()) {
+            if(millis() - waitStart > 30000) {
+                Serial.println("\n⏱️ Tiempo agotado, cancelado");
+                return;
+            }
+            delay(10);
+        }
         String pass = Serial.readStringUntil('\n');
         pass.trim();
         
         // Guardar configuración
-        preferences.putString("ssid", ssid);
-        preferences.putString("password", pass);
+        WiFi_SaveCredentials(ssid, pass);
         
         Serial.println("\n✅ Configuración guardada. Reiniciando...");
         delay(1000);
@@ -2169,8 +2473,8 @@ void OS_ExecuteCommand(String cmd) {
             Serial.printf("Gateway: %s\n", WiFi.gatewayIP().toString().c_str());
             Serial.printf("DNS: %s\n", WiFi.dnsIP().toString().c_str());
             Serial.printf("MAC: %s\n", WiFi.macAddress().c_str());
-            Serial.printf("Señal: %d dBm\n", WiFi.RSSI());
-            Serial.printf("Canal: %d\n", WiFi.channel());
+            Serial.printf("Señal: %d dBm\n", (int)WiFi.RSSI());
+            Serial.printf("Canal: %d\n", (int)WiFi.channel());
         } else if(apMode) {
             Serial.println("Estado: Modo AP 📡");
             Serial.printf("SSID: %s\n", AP_SSID);
@@ -2184,17 +2488,16 @@ void OS_ExecuteCommand(String cmd) {
     }
     else if(cmd == "wifi ap") {
         Serial.println("\n🔄 Cambiando a modo AP...");
-        preferences.putString("ssid", "");
-        preferences.putString("password", "");
+        WiFi_SaveCredentials("", "");
         delay(500);
         ESP.restart();
     }
     else if(cmd == "led on") {
-        digitalWrite(LED_BUILTIN, HIGH);
+        ledWrite(true);
         Serial.println("\n💡 LED encendido\n");
     }
     else if(cmd == "led off") {
-        digitalWrite(LED_BUILTIN, LOW);
+        ledWrite(false);
         Serial.println("\n💡 LED apagado\n");
     }
     else if(cmd == "reboot") {
@@ -2215,16 +2518,16 @@ void OS_ExecuteCommand(String cmd) {
 void taskBlink() {
     static bool ledState = false;
     ledState = !ledState;
-    digitalWrite(LED_BUILTIN, ledState);
+    ledWrite(ledState);
 }
 
 // Monitor del sistema
 void taskMonitor() {
     static int count = 0;
     if(++count >= 60) { // Cada 30 segundos (60 * 500ms)
-        Serial.printf("\n[Monitor] Up:%lus | RAM:%d | T:%.1f°C | WiFi:%s\n> ", 
+        Serial.printf("\n[Monitor] Up:%lus | RAM:%lu | T:%.1f°C | WiFi:%s\n> ", 
             systemTime/1000, 
-            ESP.getFreeHeap(), 
+            (unsigned long)ESP.getFreeHeap(), 
             temperatureRead(),
             wifiConnected ? "OK" : (apMode ? "AP" : "OFF"));
         count = 0;
@@ -2239,24 +2542,44 @@ void taskWebServer() {
 // Verificar conexión WiFi
 void taskWiFiCheck() {
     static int failCount = 0;
-    
-    if(!apMode && !wifiConnected) {
-        if(WiFi.status() == WL_CONNECTED) {
+    static unsigned long lastRetry = 0;
+
+    bool connected = (WiFi.status() == WL_CONNECTED);
+
+    if(connected) {
+        if(!wifiConnected) {
             wifiConnected = true;
             localIP = WiFi.localIP();
-            Serial.printf("\n[WiFi] ✅ Reconectado! IP: %s\n> ", localIP.toString().c_str());
-            failCount = 0;
-        } else {
-            failCount++;
-            if(failCount > 20) { // 20 segundos sin conexión
-                Serial.println("\n[WiFi] ⚠️ Sin conexión, cambiando a modo AP...");
-                WiFi_StartAP();
-                failCount = 0;
-            }
+            Serial.printf("\n[WiFi] ✅ Conectado! IP: %s\n> ", localIP.toString().c_str());
         }
-    } else if(wifiConnected && WiFi.status() != WL_CONNECTED) {
+        failCount = 0;
+        return;
+    }
+
+    if(wifiConnected) {
         wifiConnected = false;
         Serial.println("\n[WiFi] ❌ Conexión perdida\n> ");
+    }
+
+    // Sin credenciales guardadas solo tiene sentido el modo AP
+    if(wifiSSID.length() == 0) return;
+
+    failCount++;
+
+    // Reintentar la conexión periódicamente, también estando en modo AP.
+    // Antes, una vez que apMode pasaba a true no se volvía a intentar jamás y
+    // el equipo se quedaba en AP hasta un reinicio manual.
+    if(millis() - lastRetry >= WIFI_RETRY_INTERVAL) {
+        lastRetry = millis();
+        Serial.printf("\n[WiFi] 🔄 Reintentando conexión a %s...\n> ", wifiSSID.c_str());
+        WiFi.disconnect();
+        WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str());
+    }
+
+    // Tras 20 s sin red se levanta el AP para no quedarse incomunicado
+    if(!apMode && failCount > 20) {
+        Serial.println("\n[WiFi] ⚠️ Sin conexión, levantando modo AP...");
+        WiFi_StartAP();
     }
 }
 
@@ -2265,8 +2588,8 @@ void taskWiFiCheck() {
 // ============================================
 
 void setup() {
-    pinMode(LED_BUILTIN, OUTPUT);
-    digitalWrite(LED_BUILTIN, LOW);  // Apagar LED al inicio
+    pinMode(LED_PIN, OUTPUT);
+    ledWrite(false);  // Apagar LED al inicio
 
     // Inicializar OS
     OS_Init();
